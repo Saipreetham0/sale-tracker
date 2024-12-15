@@ -9,13 +9,15 @@
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.saipreetham.saletracker"
     },
     "android": {
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/adaptive-icon.png",
         "backgroundColor": "#ffffff"
-      }
+      },
+      "package": "com.saipreetham.saletracker"
     },
     "web": {
       "bundler": "metro",
@@ -32,6 +34,16 @@
           "resizeMode": "contain",
           "backgroundColor": "#ffffff"
         }
+      ],
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/images/icon.png",
+          "color": "#ffffff",
+          "sounds": [
+            "./assets/sounds/notification-sound.mp3"
+          ]
+        }
       ]
     ],
     "experiments": {
@@ -45,6 +57,10 @@
         "projectId": "8551b0a3-291d-4bc2-90f3-4f0378a19c55"
       }
     },
-    "owner": "saipreetham"
+    "owner": "saipreetham",
+    "runtimeVersion": "1.0.0",
+    "updates": {
+      "url": "https://u.expo.dev/8551b0a3-291d-4bc2-90f3-4f0378a19c55"
+    }
   }
 }

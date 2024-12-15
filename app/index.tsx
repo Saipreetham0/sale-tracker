@@ -1,23 +1,5 @@
-// import { Text, View } from "react-native";
 
-// export default function Index() {
-//   return (
-//     <View
-//       style={{
-//         flex: 1,
-//         justifyContent: "center",
-//         alignItems: "center",
-//       }}
-//     >
-//       <Text>Edit app/index.tsx to edit this screen.</Text>
-
-//     </View>
-//   );
-// }
-
-
-
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import {
   View,
   Text,
@@ -25,8 +7,10 @@ import {
   TouchableOpacity,
   Alert,
   Platform,
+  ScrollView,
 } from "react-native";
 import * as Location from "expo-location";
+import * as Notifications from "expo-notifications";
 import moment from "moment";
 import { initializeApp } from "firebase/app";
 import {
@@ -39,7 +23,6 @@ import {
 } from "firebase/firestore";
 import Constants from "expo-constants";
 
-// Firebase Configuration
 const firebaseConfig = {
   apiKey: "AIzaSyB4hGeI1FS1JT1lKFQGY-aaJt66ccYTpQw",
   authDomain: "ksp-iot.firebaseapp.com",
@@ -52,9 +35,20 @@ const firebaseConfig = {
   measurementId: "G-SXZ891F3QF",
 };
 
+
+
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app);
+
+// Configure notifications
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowAlert: true,
+    shouldPlaySound: false,
+    shouldSetBadge: false,
+  }),
+});
 
 // Type definitions
 interface LocationCoords {
@@ -63,7 +57,7 @@ interface LocationCoords {
 }
 
 interface PunchRecord {
-  type: "Punch In" | "Punch Out";
+  type: "Punch In" | "Punch Out" | "Location Update";
   timestamp: string;
   location: string;
   deviceId: string;
@@ -73,64 +67,95 @@ interface PunchRecord {
   };
 }
 
+const LOCATION_INTERVAL = 5 * 60 * 1000; // 5 minutes in milliseconds
+
 const PunchTracker: React.FC = () => {
   const [isPunchedIn, setIsPunchedIn] = useState<boolean>(false);
-  const [currentLocation, setCurrentLocation] = useState<LocationCoords | null>(
-    null
-  );
+  const [currentLocation, setCurrentLocation] = useState<LocationCoords | null>(null);
   const [punchHistory, setPunchHistory] = useState<PunchRecord[]>([]);
+  const locationIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const notificationRef = useRef<string | null>(null);
+  const isTracking = useRef<boolean>(false);
 
-  // Ensure device ID is a non-empty string
   const DEVICE_ID = Constants.installationId || "UNKNOWN_DEVICE";
 
-  // Request location permissions and load history
   useEffect(() => {
+    let isMounted = true;
+
     const initializeTracker = async () => {
       try {
         // Request location permissions
-        let { status } = await Location.requestForegroundPermissionsAsync();
-        if (status !== "granted") {
-          Alert.alert(
-            "Permission Denied",
-            "Location permission is required to track punches."
-          );
+        const { status: locationStatus } = await Location.requestForegroundPermissionsAsync();
+        if (!isMounted) return;
+
+        if (locationStatus !== "granted") {
+          Alert.alert("Permission Denied", "Location permission is required.");
           return;
         }
 
-        // Load punch history
+        // Request background location permissions
+        const { status: backgroundStatus } = await Location.requestBackgroundPermissionsAsync();
+        if (!isMounted) return;
+
+        if (backgroundStatus !== "granted") {
+          Alert.alert("Permission Denied", "Background location permission is required.");
+          return;
+        }
+
+        // Request notification permissions
+        const { status: notificationStatus } = await Notifications.requestPermissionsAsync();
+        if (!isMounted) return;
+
+        if (notificationStatus !== "granted") {
+          Alert.alert("Permission Denied", "Notification permission is required.");
+          return;
+        }
+
         await loadPunchHistory();
       } catch (error) {
+        if (!isMounted) return;
         console.error("Initialization error:", error);
+        Alert.alert("Error", "Failed to initialize the tracker.");
       }
     };
 
     initializeTracker();
-  }, []);
 
-  // Get current location
-  const getCurrentLocation =
-    async (): Promise<Location.LocationObjectCoords | null> => {
-      try {
-        let location = await Location.getCurrentPositionAsync({});
-        const coords: LocationCoords = {
-          latitude: location.coords.latitude,
-          longitude: location.coords.longitude,
-        };
-        setCurrentLocation(coords);
-        return location.coords;
-      } catch (error) {
-        Alert.alert("Location Error", "Unable to retrieve current location");
-        return null;
+    return () => {
+      isMounted = false;
+      if (locationIntervalRef.current) {
+        clearInterval(locationIntervalRef.current);
+      }
+      if (isTracking.current) {
+        stopLocationTracking();
       }
     };
+  }, []);
 
-  // Save punch record to Firestore
+  const getCurrentLocation = async (): Promise<Location.LocationObjectCoords | null> => {
+    try {
+      const location = await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.High,
+      });
+
+      setCurrentLocation({
+        latitude: location.coords.latitude,
+        longitude: location.coords.longitude,
+      });
+
+      return location.coords;
+    } catch (error) {
+      console.error("Location Error:", error);
+      Alert.alert("Error", "Unable to get current location.");
+      return null;
+    }
+  };
+
   const savePunchRecord = async (
-    type: "Punch In" | "Punch Out",
+    type: PunchRecord["type"],
     location: Location.LocationObjectCoords | null
   ): Promise<void> => {
     try {
-      // Prepare the record with default/fallback values
       const newRecord: PunchRecord = {
         type,
         timestamp: moment().toISOString(),
@@ -140,44 +165,27 @@ const PunchTracker: React.FC = () => {
         deviceId: DEVICE_ID,
         deviceInfo: {
           platform: Platform.OS || "Unknown",
-          osVersion: Platform.Version ? Platform.Version.toString() : "Unknown",
+          osVersion: Platform.Version?.toString() || "Unknown",
         },
       };
 
-      // Validate record before saving
-      const sanitizedRecord = Object.fromEntries(
-        Object.entries(newRecord).map(([key, value]) => [
-          key,
-          value === undefined ? "Unknown" : value,
-        ])
-      );
+      await addDoc(collection(db, "punchRecords"), newRecord);
+      setPunchHistory(prev => [newRecord, ...prev]);
 
-      // Add to Firestore
-      const docRef = await addDoc(
-        collection(db, "punchRecords"),
-        sanitizedRecord
-      );
-
-      // Update local state
-      setPunchHistory((prev) => [newRecord, ...prev]);
-
-      // Show success alert
-      Alert.alert(
-        "Punch " + (type === "Punch In" ? "In" : "Out"),
-        `Successfully ${
-          type === "Punch In" ? "punched in" : "punched out"
-        } at ${moment().format("HH:mm:ss")}`
-      );
+      if (type !== "Location Update") {
+        Alert.alert(
+          `Punch ${type === "Punch In" ? "In" : "Out"}`,
+          `Successfully ${type.toLowerCase()} at ${moment().format("HH:mm:ss")}`
+        );
+      }
     } catch (error) {
-      console.error("Error saving punch record", error);
-      Alert.alert("Error", "Failed to save punch record");
+      console.error("Error saving punch record:", error);
+      Alert.alert("Error", "Failed to save punch record.");
     }
   };
 
-  // Load punch history from Firestore
   const loadPunchHistory = async (): Promise<void> => {
     try {
-      // Query for punch records, ordered by timestamp
       const q = query(
         collection(db, "punchRecords"),
         orderBy("timestamp", "desc")
@@ -185,39 +193,62 @@ const PunchTracker: React.FC = () => {
 
       const querySnapshot = await getDocs(q);
       const history: PunchRecord[] = querySnapshot.docs.map(
-        (doc) => doc.data() as PunchRecord
+        doc => doc.data() as PunchRecord
       );
 
       setPunchHistory(history);
     } catch (error) {
-      console.error("Error loading punch history", error);
+      console.error("Error loading punch history:", error);
+      Alert.alert("Error", "Failed to load punch history.");
     }
   };
 
-  // Punch In/Out Handler
-  const handlePunchAction = async (): Promise<void> => {
+  const startLocationTracking = async () => {
     const location = await getCurrentLocation();
-
     if (location) {
-      // Determine punch type
-      const newPunchStatus = !isPunchedIn;
-      setIsPunchedIn(newPunchStatus);
+      isTracking.current = true;
+      await savePunchRecord("Punch In", location);
 
-      // Save punch record
-      await savePunchRecord(
-        newPunchStatus ? "Punch In" : "Punch Out",
-        location
-      );
+      locationIntervalRef.current = setInterval(async () => {
+        const newLocation = await getCurrentLocation();
+        if (newLocation) {
+          await savePunchRecord("Location Update", newLocation);
+        }
+      }, LOCATION_INTERVAL);
+    }
+  };
+
+  const stopLocationTracking = async () => {
+    if (locationIntervalRef.current) {
+      clearInterval(locationIntervalRef.current);
+      locationIntervalRef.current = null;
+    }
+
+    isTracking.current = false;
+    const location = await getCurrentLocation();
+    if (location) {
+      await savePunchRecord("Punch Out", location);
+    }
+  };
+
+  const handlePunchAction = async () => {
+    try {
+      if (!isPunchedIn) {
+        await startLocationTracking();
+      } else {
+        await stopLocationTracking();
+      }
+      setIsPunchedIn(!isPunchedIn);
+    } catch (error) {
+      console.error("Error handling punch action:", error);
+      Alert.alert("Error", "Failed to process punch action.");
     }
   };
 
   return (
     <View style={styles.container}>
       <TouchableOpacity
-        style={[
-          styles.punchButton,
-          { backgroundColor: isPunchedIn ? "red" : "green" },
-        ]}
+        style={[styles.punchButton, { backgroundColor: isPunchedIn ? "#ff4444" : "#44aa44" }]}
         onPress={handlePunchAction}
       >
         <Text style={styles.buttonText}>
@@ -227,7 +258,7 @@ const PunchTracker: React.FC = () => {
 
       {currentLocation && (
         <View style={styles.locationContainer}>
-          <Text>Current Location:</Text>
+          <Text style={styles.locationText}>Current Location:</Text>
           <Text>Latitude: {currentLocation.latitude.toFixed(4)}</Text>
           <Text>Longitude: {currentLocation.longitude.toFixed(4)}</Text>
         </View>
@@ -235,31 +266,28 @@ const PunchTracker: React.FC = () => {
 
       <View style={styles.historyContainer}>
         <Text style={styles.historyTitle}>Punch History</Text>
-        {punchHistory.map((record, index) => (
-          <View key={index} style={styles.historyItem}>
-            <Text>
-              {record.type} -{" "}
-              {moment(record.timestamp).format("YYYY-MM-DD HH:mm:ss")}
-            </Text>
-            <Text>Location: {record.location}</Text>
-            <Text>Device: {record.deviceId}</Text>
-          </View>
-        ))}
+        <ScrollView style={styles.scrollView}>
+          {punchHistory.map((record, index) => (
+            <View key={index} style={styles.historyItem}>
+              <Text style={styles.recordType}>{record.type}</Text>
+              <Text>{moment(record.timestamp).format("YYYY-MM-DD HH:mm:ss")}</Text>
+              <Text>Location: {record.location}</Text>
+            </View>
+          ))}
+        </ScrollView>
       </View>
     </View>
   );
 };
 
 const styles = StyleSheet.create({
-  // ... (styles remain the same as in previous example)
   container: {
     flex: 1,
-    justifyContent: "center",
-    alignItems: "center",
     padding: 20,
+    backgroundColor: "#fff",
   },
   punchButton: {
-    width: 200,
+    width: "100%",
     padding: 15,
     borderRadius: 10,
     alignItems: "center",
@@ -271,25 +299,39 @@ const styles = StyleSheet.create({
     fontWeight: "bold",
   },
   locationContainer: {
-    marginVertical: 10,
-    alignItems: "center",
+    padding: 15,
+    backgroundColor: "#f5f5f5",
+    borderRadius: 10,
+    marginBottom: 20,
+  },
+  locationText: {
+    fontSize: 16,
+    fontWeight: "bold",
+    marginBottom: 5,
   },
   historyContainer: {
-    width: "100%",
-    marginTop: 20,
+    flex: 1,
   },
   historyTitle: {
-    fontSize: 18,
+    fontSize: 20,
     fontWeight: "bold",
     marginBottom: 10,
-    textAlign: "center",
+  },
+  scrollView: {
+    flex: 1,
   },
   historyItem: {
-    backgroundColor: "#f0f0f0",
-    padding: 10,
-    marginVertical: 5,
-    borderRadius: 5,
+    padding: 15,
+    backgroundColor: "#f9f9f9",
+    borderRadius: 10,
+    marginBottom: 10,
+  },
+  recordType: {
+    fontSize: 16,
+    fontWeight: "bold",
+    marginBottom: 5,
   },
 });
 
 export default PunchTracker;
+
